@@ -29,12 +29,38 @@ export async function runAction(
   key: string,
   id: number,
   action: string,
+  context: Record<string, unknown> = {},
 ): Promise<ActionResult> {
   const response = await request(`/api/${key}/${id}/actions`, {
     method: 'POST',
-    body: JSON.stringify({ action }),
+    body: JSON.stringify({ action, ...context }),
   })
   return await response.json()
+}
+
+export async function postWorkflow<T = ActionResult>(
+  path: string,
+  body: Record<string, unknown> = {},
+): Promise<T> {
+  const response = await request(path, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+  return await response.json()
+}
+
+export async function getWorkflowTrace(path: string): Promise<ActionResult> {
+  const response = await request(path)
+  return await response.json()
+}
+
+export function workflowDownload(path: string): void {
+  const anchor = document.createElement('a')
+  anchor.href = path
+  anchor.download = ''
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
 }
 
 export async function downloadEntries(

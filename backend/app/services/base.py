@@ -53,13 +53,26 @@ class BaseModuleService:
         rows = store.rows(self.MODULE)
         entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
         entry.update({field: values.get(field) for field in self.LIST_FIELDS})
+        # 正文、校验值、幂等键、来源和修订引用等字段虽然不一定出现在列表列中，
+        # 但属于跨模块传递的业务载荷，登记时不能被通用骨架丢弃。
+        protected = {"id", "status", "pending", "abnormal"}
+        for key, value in values.items():
+            if key in protected or key in entry:
+                continue
+            if value is not None:
+                entry[key] = value
         entry["status"] = self.STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False
         rows.append(entry)
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(
+        self,
+        entry_id: int,
+        action: str,
+        context: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
@@ -69,6 +82,9 @@ class BaseModuleService:
         entry["status"] = target
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+        if context:
+            # 保留动作上下文，便于版本详情、重算和装包链路追溯正文来源。
+            entry["last_action_context"] = context
         return entry, f"{self.ENTITY}已{action}"
 
     def domain_snapshot(self) -> dict[str, Any]:

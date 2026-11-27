@@ -4,6 +4,11 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.revision_delivery import (
+    md5_short,
+    sha256_full,
+    workflow,
+)
 from app.store import store
 
 
@@ -20,6 +25,7 @@ class TranscriptVersionService(BaseModuleService):
     def create_version(
         self, version_id: str, task_id: str, version_no: str,
         parent: str, change_lines: int, summary: str,
+        content: str | None = None, **kwargs: Any,
     ) -> tuple[dict[str, Any] | None, str]:
         """创建新转写版本。"""
         rows = store.rows(self.MODULE)
@@ -34,7 +40,32 @@ class TranscriptVersionService(BaseModuleService):
             "生效时间": "-", "被引用次数": "0",
             "status": "草稿", "pending": True, "abnormal": False,
         }
+        if content is not None:
+            entry.update({
+                "正文": content,
+                "content": content,
+                "更正正文": content,
+                "checksum": md5_short(content),
+                "sha256": sha256_full(content),
+            })
         rows.append(entry)
+        if content is not None:
+            code = workflow.normalize_version_code(version_no) or version_no
+            revision_id = str(kwargs.get("revision_id") or f"REV-{version_id}")
+            revision = workflow._make_revision_record(
+                revision_id=revision_id,
+                version_pk=version_id,
+                version_code=code,
+                task_id=task_id,
+                media_id=str(kwargs.get("media_id") or "MEDI-0001"),
+                content=content,
+                parent_revision_id=workflow.version_index.get(str(parent)),
+                correction_ids=list(kwargs.get("correction_ids") or []),
+                source=str(kwargs.get("source") or "version_create"),
+                summary=summary,
+            )
+            workflow._index_revision(revision)
+            entry["_revision_id"] = revision_id
         return entry, f"版本 {version_id} 已创建"
 
     def get_effective_version(self, task_id: str) -> dict[str, Any] | None:
@@ -69,3 +100,41 @@ class TranscriptVersionService(BaseModuleService):
         vers = [r for r in rows if r.get("关联任务") == task_id]
         vers.sort(key=lambda r: r.get("版本号", "v0"))
         return vers
+
+    def get_version_detail(self, version_ref: Any) -> dict[str, Any] | None:
+        """返回带更正正文、重算结果和来源的版本详情。"""
+        revision = workflow.resolve_revision(version_ref)
+        row = workflow._find_store_row(self.MODULE, version_ref)
+        if revision is None and row is None:
+            return None
+        detail = dict(row or {})
+        if revision is not None:
+            detail["revision"] = revision
+            detail["recompute"] = revision.get("recompute")
+            detail["completion_basis"] = revision.get("completion_basis")
+            detail["来源"] = revision.get("来源")
+            for key in ("正文", "content", "更正正文", "checksum", "sha256", "修订编号", "重算编号"):
+                detail.setdefault(key, revision.get(key))
+        return detail
+
+    def get_revision(self, version_ref: Any) -> dict[str, Any] | None:
+        return workflow.resolve_revision(version_ref)
+
+    def get_content(self, version_ref: Any) -> str | None:
+        revision = workflow.resolve_revision(version_ref)
+        if revision is not None:
+            return str(revision.get("content"))
+        row = workflow._find_store_row(self.MODULE, version_ref)
+        value = (row or {}).get("正文") or (row or {}).get("content")
+        return None if value is None else str(value)
+
+    def download_version(self, version_ref: Any) -> dict[str, Any]:
+        return workflow.download(version_ref)
+
+    def verify_version(self, version_ref: Any, content: str | None = None) -> dict[str, Any]:
+        revision = workflow.resolve_revision(version_ref)
+        if revision is None:
+            return {"ok": False, "verified": False, "message": f"版本 {version_ref} 不存在"}
+        body = revision["content"] if content is None else content
+        verification = workflow.verify_content_against_revision(revision, body)
+        return {"ok": verification["verified"], **verification, "revision": revision}

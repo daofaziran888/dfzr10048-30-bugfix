@@ -73,6 +73,19 @@ npm run dev
 | 归档架位 | `archive_shelf` | 归档条目 | 归档编号、关联媒体源、架位标识 |
 | 采集审计 | `media_audit` | 审计条目 | 审计编号、关联对象、操作类型 |
 
+## 纠错—修订—装包链路
+
+纠错合入不能只传版本号：纠正后的完整正文会随合入写入新的转写版本、唯一重算记录和字幕包工件。
+
+- 纠错端：`POST /api/correction_loop/{纠错编号}/merge`，重报/续办：`POST /api/correction_loop/{纠错编号}/resubmit`
+- 字幕包端续办：`POST /api/subtitle_pack/{字幕包编号}/continue`
+- 核验确认：`POST /api/subtitle_pack/{字幕包编号}/confirm`
+- 领取：`POST /api/subtitle_pack/{字幕包编号}/claim`（也可传 `{"confirm": true}` 一步核验并领取）
+- 两端追踪同一结果：`GET /api/correction_loop/{纠错编号}/revision`、`GET /api/subtitle_pack/{字幕包编号}/revision`
+- 不可变旧版与新版文件：`GET /api/transcript_version/{版本号}/download`、`GET /api/subtitle_pack/{字幕包编号}/download`
+
+同一纠错编号、幂等键或稳定纠错内容重复提交只会得到一个修订和一份有效重算。领取时会读取磁盘工件并比对正文、MD5 短校验值与 SHA-256；残留旧字会返回“正文和包对不上”，未确认时会返回续办来源以及确认、领取路径。前端纠错回路、转写版本和字幕包页面的“修订详情”会展示同一追踪结果。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

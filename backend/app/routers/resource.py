@@ -94,5 +94,17 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    context: dict[str, Any] = {
+        "remark": payload.remark,
+        "values": payload.values or {},
+    }
+    # 显式字段和 extra="allow" 收集到的扩展字段都要进入领域上下文。
+    context.update(payload.model_dump(
+        exclude={"action", "remark", "values", "context"},
+        exclude_none=True,
+    ))
+    if payload.context:
+        context.update(payload.context)
+    context.update(payload.model_extra or {})
+    entry, message = service.run_action(entry_id, payload.action.strip(), context=context)
     return ActionResult(ok=entry is not None, message=message, entry=entry)

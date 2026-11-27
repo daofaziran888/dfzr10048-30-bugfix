@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 
@@ -17,15 +18,22 @@ class VersionEntry:
     def __init__(
         self, version_id: str, task_id: str, version_no: int,
         parent_version_no: int | None,
+        content: str | None = None,
+        correction_id: str | None = None,
+        parent_content: str | None = None,
     ):
         self.version_id = version_id
         self.task_id = task_id
         self.version_no = version_no
         self.parent_version_no = parent_version_no
+        self.content = content
+        self.correction_id = correction_id
+        self.parent_content = parent_content
         self.effective = False
         self.ref_count = 0
         self.confidence_review_passed = False
         self.overridden = False
+        self.checksum = hashlib.md5((content or "").encode()).hexdigest()[:8] if content is not None else ""
 
     def increment_ref(self) -> None:
         self.ref_count += 1
@@ -36,6 +44,10 @@ class VersionEntry:
             "task_id": self.task_id,
             "version_no": self.version_no,
             "parent_version_no": self.parent_version_no,
+            "content": self.content,
+            "correction_id": self.correction_id,
+            "parent_content": self.parent_content,
+            "checksum": self.checksum,
             "effective": self.effective,
             "ref_count": self.ref_count,
             "confidence_review_passed": self.confidence_review_passed,
@@ -80,6 +92,9 @@ class VersionConflictResolver:
                         f"版本 {v.version_id} 已被 {v.ref_count} 个字幕包引用，"
                         f"不可覆盖，请新建版本号"
                     ), None
+                if v.version_id == new_version_id:
+                    # 同一修订的超时重报/两端续办：幂等返回已有修订，不再追加版本。
+                    return True, f"版本 {new_version_id} 已存在，返回同一修订", v
                 v.overridden = True
                 break
 

@@ -39,6 +39,7 @@ class PipelineOrchestrator:
         self.archive = ArchiveReclaimer()
         self.audit_log: list[dict[str, Any]] = []
         self._run_id = 0
+        self._correction_runs: dict[str, dict[str, Any]] = {}
 
     def _log(self, link: str, step: str, outcome: str, detail: Any = None) -> None:
         self._run_id += 1
@@ -175,26 +176,145 @@ class PipelineOrchestrator:
 
     def link6_correction_loop(
         self, task_id: str, version_no: int, corrected_text: str,
+        original_text: str | None = None, **kwargs: Any,
     ) -> dict[str, Any]:
-        """链路6：纠错回路→转写版本→字幕包重算，被引用版本不得静默覆盖"""
+        """链路6：纠错回路→转写版本→字幕包重算，被引用版本不得静默覆盖。
+
+        corrected_text/正文必须进入新版本和新字幕包；同一 task+目标版本的
+        超时重报与两端续办幂等返回同一个 VersionEntry、Pack 和重算结果。
+        """
         link = "correction-loop"
-        new_version_id = f"VER-{task_id}-v{version_no + 1}"
-        ok, msg, entry = self.version.try_override(task_id, new_version_id, version_no + 1)
+        target_no = version_no + 1
+        new_version_id = kwargs.get("new_version_id") or f"VER-{task_id}-v{target_no}"
+        run_key = kwargs.get("idempotency_key") or f"{task_id}::v{target_no}"
+
+        if run_key in self._correction_runs:
+            cached = self._correction_runs[run_key]
+            self._log(link, "idempotent_replay", cached.get("new_version", run_key))
+            return {**cached, "duplicate": True, "idempotent_replay": True}
+
+        old_entry = next(
+            (v for v in self.version._versions.get(task_id, []) if v.version_no == version_no),
+            None,
+        )
+        old_version_id = old_entry.version_id if old_entry else f"VER-{task_id}-v{version_no}"
+        old_content = getattr(old_entry, "content", None)
+        explicit_content = kwargs.get("content") or kwargs.get("正文")
+
+        if explicit_content is not None:
+            new_content = str(explicit_content)
+        elif old_content and original_text is not None and original_text in old_content:
+            new_content = old_content.replace(original_text, corrected_text, 1)
+        elif old_content and "\n" not in str(corrected_text) and "-->" not in str(corrected_text):
+            # 只有短语且没有明确原词时，不能拿短语覆盖整条字幕；保留父正文，
+            # 调用方也可以通过 original_text/content 给出精确补丁或全文。
+            new_content = old_content
+        else:
+            new_content = corrected_text
+
+        ok, msg, entry = self.version.try_override(task_id, new_version_id, target_no)
         self._log(link, "version_override", "ok" if ok else f"FAIL:{msg}")
 
-        if ok:
-            review_ok, _ = self.version.set_review_result(task_id, version_no + 1, True)
+        pack_entry = None
+        recompute_result: dict[str, Any] | None = None
+        if ok and entry is not None:
+            if getattr(entry, "content", None) is None:
+                entry.content = new_content
+                entry.parent_content = old_content
+                entry.correction_id = kwargs.get("correction_id")
+                entry.checksum = hashlib.md5(new_content.encode()).hexdigest()[:8]
+
+            review_ok, _ = self.version.set_review_result(task_id, target_no, True)
             self._log(link, "review_new", "ok" if review_ok else "fail")
-            eff_ok, _ = self.version.set_effective(task_id, version_no + 1)
+            eff_ok, _ = self.version.set_effective(task_id, target_no)
             self._log(link, "effective_new", "ok" if eff_ok else "fail")
 
-            recomputed = self.pack.mark_recompute(f"VER-{task_id}-v{version_no}")
+            recomputed = self.pack.mark_recompute(old_version_id, kwargs.get("old_content"))
             self._log(link, "pack_recompute", f"{len(recomputed)} packs")
 
-        return {
+            old_packs = self.pack.get_packs_by_version(old_version_id)
+            old_pack = old_packs[0] if old_packs else None
+            pack_id = kwargs.get("pack_id") or f"PACK-{new_version_id}"
+            media_id = kwargs.get("media_id") or (old_pack.media_id if old_pack else f"MEDI-{task_id}")
+            line_count = kwargs.get("line_count") or (old_pack.line_count if old_pack else max(1, len(new_content.splitlines()) // 2))
+            duration = kwargs.get("duration_seconds") or (old_pack.duration_seconds if old_pack else 600.0)
+            export_format = kwargs.get("export_format") or (old_pack.export_format if old_pack else "SRT")
+            pack_entry = self.pack.create_pack(
+                pack_id, media_id, new_version_id,
+                int(line_count), float(duration), export_format, new_content,
+                revision_id=new_version_id,
+                correction_id=kwargs.get("correction_id"),
+                parent_version=old_version_id,
+            )
+            verification_ok = pack_entry.verify(new_content, pack_entry.checksum)
+            recompute_result = {
+                "recompute_id": f"REC-{new_version_id}",
+                "revision_id": new_version_id,
+                "pack_id": pack_id,
+                "status": "已完成",
+                "valid": verification_ok,
+                "checksum": pack_entry.checksum,
+                "content": new_content,
+                "completion_basis": {
+                    "recompute_id": f"REC-{new_version_id}",
+                    "revision_id": new_version_id,
+                    "pack_id": pack_id,
+                    "checksum": pack_entry.checksum,
+                    "verified": verification_ok,
+                    "source": kwargs.get("correction_id") or "correction_loop",
+                },
+            }
+            self._log(link, "new_pack", "ok" if verification_ok else "checksum_fail")
+
+        result = {
             "link": link, "ok": ok, "message": msg,
             "new_version": new_version_id if entry else None,
+            "new_version_id": new_version_id if entry else None,
+            "revision_id": new_version_id if entry else None,
+            "entry": entry.to_dict() if entry else None,
+            "revision": entry.to_dict() if entry else None,
+            "content": new_content if ok else None,
+            "正文": new_content if ok else None,
+            "recompute": recompute_result,
+            "completion_basis": (recompute_result or {}).get("completion_basis") if recompute_result else None,
+            "pack_id": pack_entry.pack_id if pack_entry else None,
+            "pack": pack_entry.to_dict() if pack_entry else None,
+            "duplicate": False,
         }
+        if ok:
+            self._correction_runs[run_key] = result
+        return result
+
+    def continue_link6_correction_loop(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """纠错原单重报入口；参数与 link6_correction_loop 相同，保持幂等。"""
+        return self.link6_correction_loop(*args, **kwargs)
+
+    def continue_pack_generation(
+        self, pack_id: str, source: str = "subtitle_pack", content: str | None = None,
+    ) -> dict[str, Any]:
+        """字幕包页续办：只续办同一个包/修订，不创建第二个修订。"""
+        entry = self.pack.continue_from(pack_id, source, content)
+        if entry is None:
+            return {"ok": False, "message": f"字幕包 {pack_id} 不存在"}
+        self._log("correction-loop", "pack_continue", f"{source}:{pack_id}")
+        return {"ok": True, "pack_id": pack_id, "pack": entry.to_dict(), "continued_from": entry.continued_from}
+
+    def confirm_pack(self, pack_id: str, content: str | None = None) -> dict[str, Any]:
+        entry = next((p for p in self.pack._packs if p.pack_id == pack_id), None)
+        if entry is None:
+            return {"ok": False, "confirmed": False, "message": f"字幕包 {pack_id} 不存在"}
+        ok = entry.confirm(content)
+        return {
+            "ok": ok,
+            "confirmed": ok,
+            "claimable": ok,
+            "message": "文件核验通过，属于本修订" if ok else "正文和包对不上，不能确认属于本修订",
+            "pack": entry.to_dict(),
+        }
+
+    def claim_pack(self, pack_id: str, receiver: str | None = None) -> dict[str, Any]:
+        ok, message, data = self.pack.claim(pack_id, receiver)
+        return {"ok": ok, "claimable": ok, "message": message, "pack": data}
 
     def link7_term_index(
         self, task_id: str, terms: list[dict[str, str]],
